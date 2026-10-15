@@ -1,0 +1,67 @@
+This is a fork of the original DSR Encoder by Philip Heron <phil@sanslogic.co.uk>
+It is extended with a raw stream (no 4-PSK Modulation) and the capabillity to write this raw stream via a local UDP Port.
+
+
+﻿
+-= dsrtx - Digitale Satelliten Radio (DSR) transmitter =-
+
+NOTICE
+
+The GitHub repository at https://github.com/fsphil/dsr is being removed
+at the end of 2025. The new location is: https://codeberg.org/fsphil/dsr
+Both repositories will be kept in sync until then.
+
+ABOUT
+
+DSR (Digital Satellite Radio / Digitale Satelliten Radio) is a wide
+bandwidth digital radio standard that can carry 32x 32 kHz 16:14-bit audio
+channels. These may be paired for up to 16 stereo channels.
+
+This encoder is based on the specifications in ITU-R BO.712-1.
+The output sample rate must be a multiple of DSR's symbol rate (10.24 MHz).
+
+* Supported audio input:
+- 32 khz 16-bit raw audio (mono or stereo)
+- Generated test tone
+- Optionally any audio source supported by ffmpeg
+
+* Supported output:
+- hackrf
+- SoapySDR supported devices
+- IQ file
+
+
+REQUIREMENTS
+
+Depends on libhackrf, and optionally soapysdr and ffmpeg libraries.
+
+* For Fedora (with rpmfusion)
+yum install hackrf-devel SoapySDR-devel ffmpeg-devel
+
+
+WARNING
+
+The hackrf and other SDRs are not designed to be connected directly to AV
+equipment and could be damaged by, or cause damage to, your receiver. Please
+ensure no DC voltages or control signals are sent back into the hackrf, and
+that the RF power levels out of the hackrf are not too high for your receiver.
+
+
+INSTALL
+
+In this bundled copy, dsrtx is built by the top-level makefile of DSR_Decoder:
+
+make encoder              # -> dsr_encoder/src/dsrtx
+make encoder-test         # legacy test (test_dsr)
+make encoder-test-ceedling
+
+
+RUNNING
+
+Configuration is done by ini-style file. Please see example.conf for details.
+
+$ dsrtx -c example.conf
+
+
+-Philip Heron <phil@sanslogic.co.uk>
+

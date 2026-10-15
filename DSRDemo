@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2025-2026 janosch79
+# DSRDemo - start/stop the complete DSR demo chain: bundled encoder (dsrtx) -> UDP -> decoder.
+#
+#   ./DSRDemo start [options]   build if needed, start encoder, wait until it sends, start decoder
+#   ./DSRDemo stop              stop decoder (clean, settings saved), then encoder
+#   ./DSRDemo restart [options] stop + start (without options: those of the last start)
+#   ./DSRDemo status            show what is running
+#
+# PIDs and logs live in run/. Run ./DSRDemo --help for all options.
+
+set -u
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$ROOT/$(basename "${BASH_SOURCE[0]}")"
+ENC_DIR="$ROOT/dsr_encoder"
+ENC_BIN="$ENC_DIR/src/dsrtx"
+RUN="$ROOT/run"
+ENC_LOG="$RUN/encoder.log"
+DEC_LOG="$RUN/decoder.log"
+ENC_PIDF="$RUN/encoder.pid"
+DEC_PIDF="$RUN/decoder.pid"
+SUP_PIDF="$RUN/supervisor.pid"   # process that waits for the decoder and then stops the encoder
+STATE="$RUN/state"               # conf/port/ui of the running chain, for status
+ARGS_FILE="$RUN/start.args"      # options of the last start, reused by restart
+
+usage() {
+    cat <<EOF
+Usage: ./DSRDemo start|stop|restart|status [options] [-- extra decoder options]
+
+  start     Build encoder and decoder if needed, start the encoder in the
+            background, wait until it sends, then start the decoder.
+            GUI: runs detached, closing its window stops the whole chain.
+            CLI: runs in this terminal (keys: u/d, t, h, q), quitting stops the chain.
+  stop      Stop the decoder cleanly (GUI saves its settings), then the encoder.
+            Works from any terminal.
+  restart   stop + start. Without options it reuses those of the last start.
+  status    Show whether encoder and decoder are running.
+
+Options for start/restart:
+  -c, --conf FILE     Encoder config (default: dsr_encoder/src/lifeorg.conf)
+                      Must contain an [output] with type = socket and udp://host:port
+  --gui               Use the GTK GUI decoder (dsrdec-gtk)
+  --cli               Use the command-line decoder (dsrdec)
+                      Default: GUI if a display and GTK are available, else CLI
+  --stereo L,R        Start on stereo pair L,R (e.g. 0,1)
+  --mono N            Start on mono subchannel N
+  --wait SEC          Max. time to wait for the encoder to start sending
+                      (default 60; it opens its streams one after another)
+  --rebuild           Clean and rebuild encoder and decoder
+  --no-build          Skip the build step
+
+Logs: run/encoder.log, run/decoder.log (GUI). Available configs:
+$(cd "$ENC_DIR/src" 2>/dev/null && ls -1 *.conf 2>/dev/null | sed 's/^/  dsr_encoder\/src\//')
+EOF
+}
+
+die() { echo "DSRDemo: $*" >&2; exit 1; }
+
+# --- PID handling ---------------------------------------------------------------
+# A pid file only counts if the process is still alive and is the expected program
+# (guards against stale files and reused PIDs).
+read_pid() {  # read_pid <pidfile> <cmdline pattern>
+    local pid
+    [ -r "$1" ] || return 1
+    pid="$(cat "$1" 2>/dev/null)"
+    [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/$pid/cmdline" | grep -qF -- "$2" || return 1
+    echo "$pid"
+}
+enc_pid() { read_pid "$ENC_PIDF" "$ENC_BIN"; }
+dec_pid() { read_pid "$DEC_PIDF" "$ROOT/dsrdec"; }
+sup_pid() { read_pid "$SUP_PIDF" "DSRDemo"; }
+
+wait_gone() {  # wait_gone <pid> <seconds>; returns 1 if still alive afterwards
+    local i
+    for ((i = 0; i < $2 * 10; i++)); do
+        kill -0 "$1" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    ! kill -0 "$1" 2>/dev/null
+}
+
+# Exactly one SIGTERM: dsrtx shuts down on the first signal, a second one makes it exit(-1).
+stop_encoder() {
+    local pid
+    if pid="$(enc_pid)"; then
+        echo "==> Stopping encoder (pid $pid)"
+        kill -TERM "$pid" 2>/dev/null
+        if ! wait_gone "$pid" 5; then
+            echo "    encoder does not react, killing it" >&2
+            kill -KILL "$pid" 2>/dev/null
+        fi
+    fi
+    rm -f "$ENC_PIDF" "$STATE"
+}
+
+# GUI: SIGTERM acts like closing the window. CLI: SIGINT is its clean quit path.
+stop_decoder() {
+    local pid sig=TERM
+    pid="$(dec_pid)" || { rm -f "$DEC_PIDF"; return 0; }
+    tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q 'dsrdec-gtk' || sig=INT
+    echo "==> Stopping decoder (pid $pid)"
+    kill -"$sig" "$pid" 2>/dev/null
+    if ! wait_gone "$pid" 5; then
+        echo "    decoder does not react, killing it" >&2
+        kill -KILL "$pid" 2>/dev/null
+    fi
+    rm -f "$DEC_PIDF"
+}
+
+cmd_stop() {
+    local pid
+    if ! enc_pid >/dev/null && ! dec_pid >/dev/null; then
+        echo "DSR demo is not running."
+        rm -f "$ENC_PIDF" "$DEC_PIDF" "$SUP_PIDF" "$STATE"
+        return 0
+    fi
+    stop_decoder
+    # The supervisor notices the decoder is gone and stops the encoder itself;
+    # give it the chance, so the encoder gets only one signal.
+    if pid="$(sup_pid)"; then wait_gone "$pid" 8; fi
+    stop_encoder
+    rm -f "$SUP_PIDF"
+    echo "DSR demo stopped."
+}
+
+cmd_status() {
+    local pid
+    if pid="$(enc_pid)"; then
+        echo "Encoder: running (pid $pid)"
+        [ -r "$STATE" ] && sed 's/^/  /' "$STATE"
+    else
+        echo "Encoder: not running"
+    fi
+    if pid="$(dec_pid)"; then
+        echo "Decoder: running (pid $pid, $(tr '\0' ' ' < "/proc/$pid/cmdline" | awk '{print $1}' | xargs basename))"
+    else
+        echo "Decoder: not running"
+    fi
+}
+
+# --- Internal: run the decoder and stop the encoder when it exits ---------------
+# Used detached for the GUI (DSRDemo _supervise <decoder cmd...>), and in the
+# foreground for the CLI via run_decoder.
+run_decoder() {
+    # <&0: keep the terminal as stdin (async commands get /dev/null otherwise; the CLI needs its keys)
+    "$@" <&0 &
+    local pid=$!
+    echo "$pid" > "$DEC_PIDF"
+    # wait returns early when a trapped signal arrives; keep waiting for the decoder
+    while kill -0 "$pid" 2>/dev/null; do wait "$pid"; done
+    rm -f "$DEC_PIDF"
+    stop_encoder
+    rm -f "$SUP_PIDF"
+}
+
+if [ "${1:-}" = "_supervise" ]; then
+    shift
+    echo $$ > "$SUP_PIDF"
+    run_decoder "$@"
+    exit 0
+fi
+
+# --- start ----------------------------------------------------------------------
+cmd_start() {
+    local CONF="$ENC_DIR/src/lifeorg.conf" UI="auto" DO_BUILD=1 REBUILD=0 WAIT_SECS=60
+    local CHANNEL_ARGS=() DEC_ARGS=() pid
+
+    if pid="$(enc_pid)" || pid="$(dec_pid)"; then
+        die "already running (pid $pid). Use ./DSRDemo restart or ./DSRDemo stop."
+    fi
+    mkdir -p "$RUN"
+    rm -f "$ENC_PIDF" "$DEC_PIDF" "$SUP_PIDF" "$STATE"
+    if [ $# -gt 0 ]; then printf '%s\0' "$@"; fi > "$ARGS_FILE"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -c|--conf)   [ $# -ge 2 ] || die "$1 needs a file"; CONF="$2"; shift ;;
+            --gui)       UI="gui" ;;
+            --cli)       UI="cli" ;;
+            --stereo|--mono)
+                         [ $# -ge 2 ] || die "$1 needs a value"; CHANNEL_ARGS+=("$1" "$2"); shift ;;
+            --wait)      [ $# -ge 2 ] || die "$1 needs seconds"; WAIT_SECS="$2"; shift
+                         case "$WAIT_SECS" in ''|*[!0-9]*) die "--wait needs a whole number of seconds" ;; esac ;;
+            --rebuild)   REBUILD=1 ;;
+            --no-build)  DO_BUILD=0 ;;
+            --)          shift; DEC_ARGS=("$@"); break ;;
+            *)           die "unknown option '$1' (see --help)" ;;
+        esac
+        shift
+    done
+
+    [ -f "$CONF" ] || die "config not found: $CONF"
+    CONF="$(cd "$(dirname "$CONF")" && pwd)/$(basename "$CONF")"
+
+    # Decoder frontend
+    have_gtk() { pkg-config --exists gtk+-3.0 2>/dev/null; }
+    if [ "$UI" = "auto" ]; then
+        if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && have_gtk; then UI="gui"; else UI="cli"; fi
+    fi
+
+    # Dependencies and build
+    if [ $DO_BUILD -eq 1 ]; then
+        local missing=() pkgs=()
+        command -v gcc        >/dev/null || { missing+=("gcc");        pkgs+=("build-essential"); }
+        command -v make       >/dev/null || { missing+=("make");       pkgs+=("build-essential"); }
+        command -v pkg-config >/dev/null || { missing+=("pkg-config"); pkgs+=("pkg-config"); }
+        if command -v pkg-config >/dev/null; then
+            pkg-config --exists alsa      || { missing+=("ALSA");      pkgs+=("libasound2-dev"); }
+            pkg-config --exists libhackrf || { missing+=("libhackrf"); pkgs+=("libhackrf-dev"); }
+            pkg-config --exists libavcodec libavformat libavdevice libswresample libavutil || {
+                missing+=("ffmpeg libs")
+                pkgs+=("libavcodec-dev" "libavformat-dev" "libavdevice-dev" "libswresample-dev" "libavutil-dev")
+            }
+            if [ "$UI" = "gui" ] && ! have_gtk; then missing+=("GTK 3"); pkgs+=("libgtk-3-dev"); fi
+        fi
+        if [ ${#missing[@]} -gt 0 ]; then
+            echo "DSRDemo: missing build dependencies: ${missing[*]}" >&2
+            echo "On Debian/Ubuntu install them with:" >&2
+            echo "  sudo apt install $(printf '%s\n' "${pkgs[@]}" | sort -u | tr '\n' ' ')" >&2
+            exit 1
+        fi
+        if [ $REBUILD -eq 1 ]; then
+            make -C "$ROOT" clean >/dev/null
+        fi
+        echo "==> Building encoder (dsr_encoder/src/dsrtx)"
+        make -C "$ROOT" -s encoder || die "encoder build failed"
+        if [ "$UI" = "gui" ]; then
+            echo "==> Building decoder (dsrdec-gtk)"
+            make -C "$ROOT" -s gtk || die "decoder build failed"
+        else
+            echo "==> Building decoder (dsrdec)"
+            make -C "$ROOT" -s dsrdec || die "decoder build failed"
+        fi
+    fi
+
+    local DEC_BIN
+    if [ "$UI" = "gui" ]; then DEC_BIN="$ROOT/dsrdec-gtk"; else DEC_BIN="$ROOT/dsrdec"; fi
+    [ -x "$ENC_BIN" ] || die "encoder binary missing: $ENC_BIN (run without --no-build)"
+    [ -x "$DEC_BIN" ] || die "decoder binary missing: $DEC_BIN (run without --no-build)"
+
+    # UDP port from the config (comment lines are skipped)
+    conf_value() {  # conf_value <key> : first uncommented "key = value", comment stripped
+        sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\([^;[:space:]]*\).*/\1/p" "$CONF" | head -n1
+    }
+    local OUT_URL PORT
+    OUT_URL="$(conf_value output)"
+    case "$OUT_URL" in
+        udp://*:*) PORT="${OUT_URL##*:}" ;;
+        *) die "config $CONF has no UDP output (output = udp://host:port); found '${OUT_URL:-nothing}'" ;;
+    esac
+
+    # A decoder/encoder that is still running is the usual culprit
+    if command -v ss >/dev/null; then
+        local users
+        users="$(ss -Hlunp "sport = :$PORT" 2>/dev/null)"
+        if [ -n "$users" ]; then
+            echo "DSRDemo: UDP port $PORT is already in use (is another decoder still running?):" >&2
+            echo "$users" | sed 's/^/  /' >&2
+            exit 1
+        fi
+    fi
+
+    # Encoder. setsid: own session, so neither Ctrl+C nor closing this terminal
+    # hits it directly; it is stopped via stop_encoder. cd: relative paths in the
+    # config resolve as before. stdbuf -oL: the readiness line below shows up at once.
+    echo "==> Starting encoder with $(basename "$CONF") -> $OUT_URL"
+    ( cd "$(dirname "$CONF")" && exec setsid stdbuf -oL -eL "$ENC_BIN" -c "$CONF" ) \
+        >"$ENC_LOG" 2>&1 </dev/null &
+    echo $! > "$ENC_PIDF"
+    {
+        echo "config:  $CONF"
+        echo "output:  $OUT_URL"
+        echo "decoder: $(basename "$DEC_BIN")"
+    } > "$STATE"
+    trap 'echo; echo "DSRDemo: aborted"; stop_encoder; exit 130' INT TERM HUP
+
+    # Wait until the encoder sends its first UDP packet. dsrtx opens the ffmpeg
+    # streams one after another (several seconds) and prints this line once on the
+    # first send; starting the decoder earlier only leaves it waiting without signal.
+    local READY_MARK='UDP: Printing first' N_STREAMS deadline
+    N_STREAMS="$(grep -cE '^[[:space:]]*type[[:space:]]*=[[:space:]]*ffmpeg' "$CONF")"
+    echo "==> Waiting for encoder (opening $N_STREAMS streams, max ${WAIT_SECS}s)"
+    deadline=$((SECONDS + WAIT_SECS))
+    while ! grep -q "$READY_MARK" "$ENC_LOG"; do
+        if ! enc_pid >/dev/null; then
+            [ -t 1 ] && echo
+            echo "DSRDemo: encoder exited during startup. Last lines of run/encoder.log:" >&2
+            tail -n 20 "$ENC_LOG" >&2
+            rm -f "$ENC_PIDF" "$STATE"
+            exit 1
+        fi
+        if [ $SECONDS -ge $deadline ]; then
+            [ -t 1 ] && echo
+            echo "DSRDemo: encoder not sending after ${WAIT_SECS}s (slow or unreachable stream?)." >&2
+            echo "Last lines of run/encoder.log:" >&2
+            tail -n 10 "$ENC_LOG" >&2
+            stop_encoder
+            exit 1
+        fi
+        [ -t 1 ] && printf '\r    streams open: %d/%d ' "$(grep -c '^Using audio stream' "$ENC_LOG")" "$N_STREAMS"
+        sleep 0.2
+    done
+    [ -t 1 ] && printf '\r    streams open: %d/%d \n' "$N_STREAMS" "$N_STREAMS"
+    echo "    Encoder is sending after $((SECONDS - deadline + WAIT_SECS))s"
+
+    # Decoder
+    echo "==> Starting decoder ($(basename "$DEC_BIN")) on UDP port $PORT"
+    if [ "$UI" = "gui" ]; then
+        setsid "$SELF" _supervise "$DEC_BIN" --port "$PORT" ${CHANNEL_ARGS[@]+"${CHANNEL_ARGS[@]}"} \
+            --start ${DEC_ARGS[@]+"${DEC_ARGS[@]}"} >"$DEC_LOG" 2>&1 </dev/null &
+        trap - INT TERM HUP
+        echo
+        echo "DSR demo is running. Stop it with ./DSRDemo stop or by closing the decoder window."
+    else
+        echo "    Keys: u/d channel up/down, t channel table, h help, q quit"
+        echo $$ > "$SUP_PIDF"
+        # Ctrl+C reaches the decoder too, which quits cleanly; run_decoder then stops
+        # the encoder. A closed terminal or DSRDemo stop ends the decoder the same way.
+        trap ':' INT TERM HUP
+        run_decoder "$DEC_BIN" --port "$PORT" --audioout ${CHANNEL_ARGS[@]+"${CHANNEL_ARGS[@]}"} \
+            ${DEC_ARGS[@]+"${DEC_ARGS[@]}"}
+        echo "DSR demo stopped."
+    fi
+}
+
+# --- Main -----------------------------------------------------------------------
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+    start)   cmd_start "$@" ;;
+    stop)    cmd_stop ;;
+    status)  cmd_status ;;
+    restart)
+        cmd_stop
+        if [ $# -eq 0 ] && [ -r "$ARGS_FILE" ]; then
+            mapfile -d '' -t last < "$ARGS_FILE"
+            [ ${#last[@]} -gt 0 ] && echo "==> Reusing options of last start: ${last[*]}"
+            set -- ${last[@]+"${last[@]}"}
+        fi
+        cmd_start "$@" ;;
+    -h|--help|help) usage ;;
+    "")      usage; exit 1 ;;
+    *)       die "unknown command '$cmd' (start|stop|restart|status, see --help)" ;;
+esac

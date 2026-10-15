@@ -1,0 +1,337 @@
+' DSR Decoder architecture. Two diagrams in one file:
+'   1. DSR_Decoder_Architecture - modules, input modes and data flow
+'   2. DSR_Decoder_Threads      - threads and buffers of dsrdec and dsrdec-gtk
+
+@startuml DSR_Decoder_Architecture
+
+title DSR Decoder - Modules, Input Modes and Data Flow
+
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam defaultFontSize 12
+skinparam package {
+    BackgroundColor #FCFCFC
+    BorderColor #9E9E9E
+}
+skinparam component {
+    BackgroundColor<<External>> #FFFFFF
+    BackgroundColor<<UDP>>      #E1F5FF
+    BackgroundColor<<Raw>>      #FFF4E1
+    BackgroundColor<<IQ>>       #E8F5E9
+    BackgroundColor<<HackRF>>   #FFEBEE
+    BackgroundColor<<Core>>     #F3E5F5
+    BackgroundColor<<Pipeline>> #ECEFF1
+    BackgroundColor<<UI>>       #FFFDE7
+}
+
+' ==========================================
+' SIGNAL SOURCES AND INPUTS
+' ==========================================
+package "External signal sources" {
+    component ENC <<External>> [
+**dsrtx encoder**
+(dsr_encoder/)
+]
+    component AIR <<External>> [
+**DSR mux on cable / air**
+default 118 MHz (channel S2)
+]
+}
+
+package "Input modes" {
+    component UDP_IN <<UDP>> [
+**UDP socket**
+raw A/B bitstream
+~--host / ~--port
+]
+    component RAW_IN <<Raw>> [
+**Raw bitstream file**
+or stdin
+~--in / infile / -
+]
+    component IQ_IN <<IQ>> [
+**IQ file**
+s16le / f32le / s8
+~--iqfile
+]
+    component HRF <<HackRF>> [
+**HackRF One**
+8-bit I/Q, 20.48 MS/s
+~--hackrf
+]
+}
+
+ENC --> UDP_IN : udpsink
+ENC --> IQ_IN  : rf_file
+ENC --> AIR    : rf_hackrf (TX)
+AIR --> HRF
+AIR ..> IQ_IN  : hackrf_transfer\nrecording (.cs8)
+
+' ==========================================
+' RF FRONT END
+' ==========================================
+package "RF front end" {
+    component RX <<HackRF>> [
+**hackrf_rx.c/h**
+----
+* Device setup: frequency, rate,
+  baseband filter, LNA / VGA / amp
+* libusb callback -> 32 MiB ring;
+  overflow is dropped and counted
+* Auto gain: one LNA/VGA step per 300 ms,
+  input level kept at -22..-10 dBFS
+* Stub without libhackrf (no HAVE_HACKRF)
+]
+    component DEMOD <<IQ>> [
+**demod.c/h** - differential QPSK -> bits
+----
+* AGC, RRC matched filter, auto-map
+  (phase rotation + bit order)
+* **Fixed path** (track = 0, encoder IQ files):
+  2 samples/symbol, strobe search, bit-exact
+* **Tracking path** (~--track, ~--hackrf):
+  DC blocker, Gardner timing recovery with
+  cubic interpolation (rate near 2 x symbol rate),
+  QPSK carrier loop; reports level, CFO,
+  clock ppm, EVM
+]
+}
+
+' ==========================================
+' DECODER CORE
+' ==========================================
+package "Decoder core" {
+    component DEC <<Core>> [
+**decoder.c/h**
+----
+* A/B stream FSM, Williard sync
+* PRBS descrambler
+* Deinterleaver (auto EVEN/ODD)
+* BCH(63,44) check + correction
+* Zero Insertion (ZI) recovery
+* 14-bit -> 16-bit audio, 32 subchannels
+* Stream focus: only the selected pair
+]
+    component PA <<Core>> [
+**pa.c/h**
+----
+* SSB from A frames -> 64-bit SA frames
+* SA cycle lock + 128-SA offset
+* Programme attributes
+  (type, music/speech, mode)
+* Station labels (SK, UTF-8)
+]
+}
+
+' ==========================================
+' PIPELINE LOOP (implemented in both programs)
+' ==========================================
+package "Pipeline loop - decodermain.c (dsrdec) / dsr_engine.c (dsrdec-gtk)" as PIPE {
+    component READ <<Pipeline>> [
+**Source reader**
+----
+* fread / recv / hackrf_rx_read
+* File input paced to real time
+  with live audio
+]
+    component ACQ <<Pipeline>> [
+**Acquisition watchdog + resync**
+----
+* Tracking: no Williard **and** SA cycle lock
+  for 3 s of signal -> reset demod, decoder
+  and PA (+ flush HackRF ring), acquire again
+* HackRF USB drop -> hard resync
+* Auto gain from demod input level
+* Manual resync: ingest paused 120 ms,
+  at most once per second
+]
+    component POST <<Pipeline>> [
+**Audio post-processing**
+----
+* Channel / pair selection
+* DC blocker, slew limiter, upsample
+* Warm-up gate: muted for 2 s and until
+  Williard, deinterleave, SA cycle
+  and SA offset are locked
+]
+    component PCMQ <<Pipeline>> [
+**PCM ring + audio thread**
+decouples ALSA from decoding
+]
+}
+
+' ==========================================
+' AUDIO OUTPUT
+' ==========================================
+package "Audio output" {
+    component ALSA <<Core>> [
+**alsa.c/h**
+live playback
+]
+    component WAV <<Core>> [
+**wave.c/h**
+WAV recording (16-bit)
+]
+}
+
+' ==========================================
+' PROGRAMS
+' ==========================================
+package "Programs" {
+    component CLI <<UI>> [
+**dsrdec** - decodermain.c
+----
+Argument parser, mode selection,
+keyboard control, stat / rf lines
+]
+    component GTK <<UI>> [
+**dsrdec-gtk** - gtkmain.c
+----
+Window, channel list, controls,
+settings file, refresh every 200 ms
+]
+    component ENGINE <<UI>> [
+**dsr_engine.c/h** - engine_t
+----
+Restartable pipeline: thread-safe
+commands and status snapshots
+]
+}
+
+CLI    ..> PIPE   : runs inline
+GTK    ..> ENGINE : start / stop,\ncommands, status
+ENGINE ..> PIPE   : runs in\nworker thread
+
+' ==========================================
+' DATA FLOW (colour = input mode)
+' ==========================================
+UDP_IN -[#0066CC]-> READ : bytes
+RAW_IN -[#FF8800]-> READ : bytes
+IQ_IN  -[#00AA00]-> READ : IQ chunks
+HRF    -[#CC0000]-> RX   : USB transfers
+RX     -[#CC0000]-> READ : hackrf_rx_read()\nint8 I/Q
+
+READ  -[#00AA00]-> DEMOD : demod_process()\n(IQ file, HackRF)
+DEMOD -[#00AA00]-> DEC   : decoder_push_ab_bits()\n1 bit per byte
+READ  -[#FF8800]-> DEC   : decoder_push_ab_u8()\n(raw file, UDP)
+
+DEC  -[#000000]-> PA   : pa_push_a_ssb()\nonce per A frame
+DEC  -[#000000]-> POST : 16 + 16 samples\nper A/B frame (32 kHz)
+POST -[#000000]-> PCMQ : --audioout
+PCMQ -[#000000]-> ALSA : alsa_write()
+POST -[#000000]-> WAV  : wav_write_frames()\n--wav
+
+' ==========================================
+' CONTROL (receiver loops)
+' ==========================================
+ACQ .. DEMOD : track info,\nreset
+ACQ .. RX    : auto gain,\nflush
+
+legend right
+    |= Colour |= Input mode |= Path |
+    | <#E1F5FF> Blue | UDP | bytes -> decoder_push_ab_u8 |
+    | <#FFF4E1> Orange | Raw file / stdin | bytes -> decoder_push_ab_u8 |
+    | <#E8F5E9> Green | IQ file | IQ -> demod -> decoder_push_ab_bits |
+    | <#FFEBEE> Red | HackRF One | hackrf_rx -> demod (tracking) -> decoder |
+    | Black | all | decoder -> PA, audio -> ALSA / WAV |
+    | Dotted | | control, status, uses |
+
+    **Builds**
+    dsrdec     = decodermain + decoder + demod + hackrf_rx + pa + wave + alsa
+    dsrdec-gtk = gtkmain + dsr_engine + decoder + demod + hackrf_rx + pa + wave + alsa
+endlegend
+
+@enduml
+
+
+@startuml DSR_Decoder_Threads
+
+title DSR Decoder - Threads and Buffers
+
+skinparam shadowing false
+skinparam defaultFontSize 12
+skinparam noteFontSize 11
+skinparam rectangle {
+    BackgroundColor<<Thread>> #ECEFF1
+    BackgroundColor<<UI>>     #FFFDE7
+    BackgroundColor<<Device>> #FFFFFF
+}
+skinparam queue {
+    BackgroundColor #F3E5F5
+}
+
+' ==========================================
+' dsrdec (CLI)
+' ==========================================
+package "dsrdec (decodermain.c)" {
+    rectangle "HackRF One" as C_HRF <<Device>>
+    rectangle "UDP socket" as C_SOCK <<Device>>
+    rectangle "File / stdin" as C_FILE <<Device>>
+
+    rectangle "**libusb thread**\nrx_callback()" as C_USB <<Thread>>
+    queue "HackRF RX ring 32 MiB (~0.8 s)\nfull: drop + count -> resync" as C_RXQ
+
+    rectangle "**UDP ingress thread**\nrecv()" as C_ING <<Thread>>
+    queue "Byte ring 512 KiB\nfull: block (never drops,\nkeeps bit sync)" as C_INQ
+
+    rectangle "**Decode thread**\nmain thread (file, IQ file, HackRF)\nor consumer thread (UDP)\n----\nread -> demod -> decoder / PA\n-> audio post -> WAV\nkeyboard, [stat] / [rf] lines" as C_DEC <<Thread>>
+
+    queue "PCM ring 128 KiB\nfull: drop + count" as C_PCM
+    rectangle "**Audio output thread**\nalsa_write()" as C_AO <<Thread>>
+    rectangle "ALSA" as C_ALSA <<Device>>
+}
+
+C_HRF  --> C_USB
+C_USB  --> C_RXQ
+C_RXQ  --> C_DEC : hackrf_rx_read()\n200 ms timeout
+C_SOCK --> C_ING
+C_ING  --> C_INQ
+C_INQ  --> C_DEC
+C_FILE --> C_DEC : fread()\npaced to real time\nwith --audioout
+C_DEC  --> C_PCM
+C_PCM  --> C_AO
+C_AO   --> C_ALSA
+
+' ==========================================
+' dsrdec-gtk (GUI)
+' ==========================================
+package "dsrdec-gtk (gtkmain.c + dsr_engine.c)" {
+    rectangle "**GTK main loop**\nwidgets, on_tick() every 200 ms" as G_UI <<UI>>
+
+    rectangle "HackRF One" as G_HRF <<Device>>
+    rectangle "UDP socket" as G_SOCK <<Device>>
+    rectangle "File" as G_FILE <<Device>>
+
+    rectangle "**libusb thread**\nrx_callback()" as G_USB <<Thread>>
+    queue "HackRF RX ring 32 MiB" as G_RXQ
+
+    rectangle "**Ingress thread** (UDP only)\nrecv()" as G_ING <<Thread>>
+    queue "Byte ring 512 KiB\nfull: block" as G_INQ
+
+    rectangle "**Worker thread**\nread -> demod -> decoder / PA\n-> audio post -> WAV\n-> volume / mute -> PCM ring\napplies commands,\npublishes status ~10x per second" as G_WRK <<Thread>>
+
+    queue "PCM ring 512 KiB (~4 s)\nfull: drop + count\nprefill: UDP 500 ms, HackRF 200 ms,\nfile 0; rebuilt after each xrun" as G_PCM
+    rectangle "**Audio thread**\nalsa_write()" as G_AO <<Thread>>
+    rectangle "ALSA" as G_ALSA <<Device>>
+}
+
+G_UI   --> G_WRK : engine_select / step / set_stereo /\nresync / set_mute / set_volume /\nset_log_level
+G_WRK  ..> G_UI  : engine_get_status()\n(mutex-protected snapshot)
+G_HRF  --> G_USB
+G_USB  --> G_RXQ
+G_RXQ  --> G_WRK
+G_SOCK --> G_ING
+G_ING  --> G_INQ
+G_INQ  --> G_WRK
+G_FILE --> G_WRK : fread()\npaced with live audio\nor real-time pacing option
+G_WRK  --> G_PCM
+G_PCM  --> G_AO
+G_AO   --> G_ALSA
+
+note bottom of G_WRK
+    One engine at a time; engine_start() / engine_stop()
+    create and join all threads, so the GUI can
+    restart decoding with new settings
+end note
+
+@enduml
