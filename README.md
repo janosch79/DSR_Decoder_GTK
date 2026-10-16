@@ -7,7 +7,7 @@ A matching DSR encoder (`dsrtx`) is bundled in [dsr_encoder/](dsr_encoder/), so 
 ## Quick start
 
 ```bash
-git clone https://github.com/janosch79/DSR_Decoder.git
+git clone https://github.com/janosch79/DSR_Decoder_GTK.git
 cd DSR_Decoder
 
 # Build dependencies (Debian/Ubuntu)
