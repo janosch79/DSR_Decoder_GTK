@@ -26,7 +26,17 @@
 #include <libswresample/swresample.h>
 #include <libavutil/opt.h>
 #include <libavutil/time.h>
+#include <pthread.h>
 #include "src.h"
+
+/* Live (network) inputs: a reader thread decodes into a FIFO so the encoder never
+ * blocks on the network. dsrtx runs on its own clock; a stream that delivers late or in
+ * bursts only gets a gap of silence in its own channel instead of slowing down or
+ * stopping the whole mux. */
+#define LIVE_PREFILL_FRAMES (SRC_SAMPLE_RATE)       /* 1 s cushion before (re)starting */
+#define LIVE_FIFO_FRAMES    (SRC_SAMPLE_RATE * 3)   /* 3 s; on overflow the oldest is dropped */
+#define LIVE_CHUNK_FRAMES   1152                    /* max. frames returned per read */
+#define LIVE_SILENCE_FRAMES 64                      /* one DSR block (2 ms) of silence */
 
 typedef struct {
 	
@@ -44,6 +54,19 @@ typedef struct {
 	
 	/* Audio level */
 	double level;
+	
+	/* Live input: reader thread -> FIFO (interleaved stereo frames) */
+	int live;
+	char *url;
+	pthread_t thread;
+	pthread_mutex_t mu;
+	int16_t *fifo;
+	uint64_t head, tail;	/* frames written / read, under mu */
+	int primed;		/* consumer side: cushion reached, playing */
+	int eof;		/* reader thread finished (stream ended or failed) */
+	volatile int stop;
+	uint64_t underruns;
+	int16_t out[LIVE_CHUNK_FRAMES * 2];
 	
 } src_ffmpeg_t;
 
@@ -117,8 +140,110 @@ static int _src_ffmpeg_read(src_ffmpeg_t *src, int16_t *audio[2], int audio_step
 	return(r);
 }
 
+static int _live_interrupt(void *opaque)
+{
+	return(((src_ffmpeg_t *) opaque)->stop);
+}
+
+static void *_live_thread(void *arg)
+{
+	src_ffmpeg_t *src = arg;
+	int16_t *audio[2];
+	int audio_step[2];
+	int r;
+	
+	while(!src->stop && (r = _src_ffmpeg_read(src, audio, audio_step)) >= 0)
+	{
+		pthread_mutex_lock(&src->mu);
+		for(int i = 0; i < r; i++)
+		{
+			if(src->head - src->tail == LIVE_FIFO_FRAMES) src->tail++;
+			int16_t *f = &src->fifo[(src->head % LIVE_FIFO_FRAMES) * 2];
+			f[0] = audio[0][i * audio_step[0]];
+			f[1] = audio[1][i * audio_step[1]];
+			src->head++;
+		}
+		pthread_mutex_unlock(&src->mu);
+	}
+	
+	pthread_mutex_lock(&src->mu);
+	src->eof = 1;
+	pthread_mutex_unlock(&src->mu);
+	if(!src->stop) fprintf(stderr, "ffmpeg: '%s' ended\n", src->url);
+	
+	return(NULL);
+}
+
+/* Never blocks: returns buffered audio, or a block of silence while the cushion is
+ * being (re)built. */
+static int _src_ffmpeg_read_live(src_ffmpeg_t *src, int16_t *audio[2], int audio_step[2])
+{
+	uint64_t avail;
+	int n;
+	
+	pthread_mutex_lock(&src->mu);
+	avail = src->head - src->tail;
+	
+	if(avail == 0 && src->eof)
+	{
+		pthread_mutex_unlock(&src->mu);
+		return(-1);
+	}
+	
+	if(!src->primed && (avail >= LIVE_PREFILL_FRAMES || src->eof))
+	{
+		src->primed = 1;
+	}
+	else if(src->primed && avail == 0)
+	{
+		src->primed = 0;
+		src->underruns++;
+		fprintf(stderr, "ffmpeg: '%s' late, inserting silence (underrun %llu)\n",
+			src->url, (unsigned long long) src->underruns);
+	}
+	
+	if(!src->primed)
+	{
+		pthread_mutex_unlock(&src->mu);
+		memset(src->out, 0, sizeof(int16_t) * 2 * LIVE_SILENCE_FRAMES);
+		n = LIVE_SILENCE_FRAMES;
+	}
+	else
+	{
+		n = avail < LIVE_CHUNK_FRAMES ? (int) avail : LIVE_CHUNK_FRAMES;
+		for(int i = 0; i < n; i++)
+		{
+			const int16_t *f = &src->fifo[((src->tail + i) % LIVE_FIFO_FRAMES) * 2];
+			src->out[i * 2 + 0] = f[0];
+			src->out[i * 2 + 1] = f[1];
+		}
+		src->tail += n;
+		pthread_mutex_unlock(&src->mu);
+	}
+	
+	audio[0] = src->out + 0;
+	audio[1] = src->out + 1;
+	audio_step[0] = audio_step[1] = 2;
+	
+	return(n);
+}
+
+int src_ffmpeg_is_live(const char *input_url)
+{
+	return(strstr(input_url, "://") != NULL && strncmp(input_url, "file:", 5) != 0);
+}
+
 static int _src_ffmpeg_close(src_ffmpeg_t *src)
 {
+	if(src->live)
+	{
+		src->stop = 1;
+		pthread_join(src->thread, NULL);
+		pthread_mutex_destroy(&src->mu);
+		free(src->fifo);
+		free(src->url);
+	}
+	
 	avcodec_free_context(&src->audio_codec_ctx);
 	swr_free(&src->swr_ctx);
 	av_frame_free(&src->frame);
@@ -294,6 +419,31 @@ int src_ffmpeg_open(src_t *s, const char *input_url, double level)
 	s->private = src;
 	s->read = (src_read_t) _src_ffmpeg_read;
 	s->close = (src_close_t) _src_ffmpeg_close;
+	
+	if(src_ffmpeg_is_live(input_url))
+	{
+		src->url = strdup(input_url);
+		src->fifo = malloc(sizeof(int16_t) * 2 * LIVE_FIFO_FRAMES);
+		if(!src->url || !src->fifo)
+		{
+			free(src->url);
+			free(src->fifo);
+			return(-1);
+		}
+		pthread_mutex_init(&src->mu, NULL);
+		src->format_ctx->interrupt_callback.callback = _live_interrupt;
+		src->format_ctx->interrupt_callback.opaque = src;
+		if(pthread_create(&src->thread, NULL, _live_thread, src) != 0)
+		{
+			fprintf(stderr, "Error starting the reader thread for '%s'\n", input_url);
+			pthread_mutex_destroy(&src->mu);
+			free(src->url);
+			free(src->fifo);
+			return(-1);
+		}
+		src->live = 1;
+		s->read = (src_read_t) _src_ffmpeg_read_live;
+	}
 	
 	return(0);
 }

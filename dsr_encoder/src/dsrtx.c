@@ -22,6 +22,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <stdlib.h>
 #include <getopt.h>
 #include <signal.h>
@@ -55,6 +56,9 @@ typedef struct {
 } dsrtx_t;
 
 volatile int _abort = 0;
+
+/* Number of channels fed from a live network stream (src_ffmpeg_is_live) */
+static int _live_sources = 0;
 
 static void _sigint_callback_handler(int signum)
 {
@@ -219,6 +223,7 @@ static void *_open_src(conf_t conf, int i)
 			free(src);
 			return(NULL);
 		}
+		if(src_ffmpeg_is_live(v)) _live_sources++;
 
 	}
 #endif
@@ -371,6 +376,16 @@ static int testrun(dsrtx_t *s)
 	 * until interrupted, matching the previous unlimited behaviour. */
 	uint64_t block_limit = s->duration > 0 ? (uint64_t)(s->duration * 500.0 + 0.5) : 0;
 	uint64_t block_count = 0;
+	
+	/* Real-time pacing. HackRF/SoapySDR are paced by their sample clock; a socket
+	 * has none, and live streams must not be read faster than they arrive. Without
+	 * it the mux follows the network: bursts, gaps and a rate below real time,
+	 * which a receiver playing on its sound card clock cannot follow. */
+	int paced = strcmp(s->output_type, "socket") == 0
+	         || (strcmp(s->output_type, "file") == 0 && _live_sources > 0);
+	const int64_t block_ns = 2000000;	/* 2 ms */
+	int64_t t0 = 0;
+	uint64_t t0_block = 0;
 
 	while(!_abort && (block_limit == 0 || block_count < block_limit))
 	{
@@ -393,6 +408,27 @@ static int testrun(dsrtx_t *s)
 		
 		/* Encode the next audio block (2ms) */
 		dsr_encode(&s->dsr, block, audio);
+		
+		if(paced)
+		{
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			int64_t now = (int64_t) ts.tv_sec * 1000000000LL + ts.tv_nsec;
+			int64_t due = t0 + (int64_t)(block_count - t0_block) * block_ns;
+			if(t0 == 0 || now - due > 100000000LL)
+			{
+				/* Start, or more than 100 ms behind (stalled): restart the clock
+				 * here rather than sending the backlog as a burst */
+				t0 = now;
+				t0_block = block_count;
+			}
+			else if(due > now)
+			{
+				ts.tv_sec = due / 1000000000LL;
+				ts.tv_nsec = due % 1000000000LL;
+				clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+			}
+		}
 		
 		/* New version with raw stream and raw_udp_stream */		
 		if ((s->data_type == RF_UNMOD_UINT8 && strcmp(s->output_type, "file") == 0)

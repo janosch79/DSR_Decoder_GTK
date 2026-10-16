@@ -49,10 +49,9 @@
 #define ALSA_PERIOD_MS         16
 #define ALSA_BUFFER_MS         128
 #define MAX_UPSAMPLE           128
-/* UDP jitter buffer: dsrtx has no output pacing; its speed comes from blocking reads of
- * live HTTP streams, so datagrams arrive in bursts about every 330 ms with gaps of up
- * to ~300 ms (measured). Hold this much audio in the PCM ring before starting playback,
- * and again after each xrun; otherwise the 128 ms ALSA buffer runs dry on every gap. */
+/* UDP jitter buffer: dsrtx paces its output to real time, but on its own clock, and the
+ * network adds jitter. Hold this much audio in the PCM ring before starting playback,
+ * and again after each xrun, so the 128 ms ALSA buffer does not run dry on a late burst. */
 #define UDP_PREFILL_MS         500
 /* HackRF delivers evenly (~6 ms USB blocks); the cushion only absorbs decode jitter and
  * the slow drift between HackRF and sound card clocks. */

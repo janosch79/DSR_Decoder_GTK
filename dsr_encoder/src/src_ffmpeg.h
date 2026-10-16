@@ -19,6 +19,8 @@
 #define _SRC_FFMPEG_H
 
 extern int src_ffmpeg_open(src_t *s, const char *input_url, double level);
+/* Network URL: read by a thread into a buffer, never blocks the encoder (needs pacing) */
+extern int src_ffmpeg_is_live(const char *input_url);
 
 extern void src_ffmpeg_init(void);
 extern void src_ffmpeg_deinit(void);

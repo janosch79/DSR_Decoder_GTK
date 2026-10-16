@@ -1,0 +1,17 @@
+# Build artefacts
+*.o
+*.d
+dsrdec
+dsrdec-gtk
+dsr_encoder/src/dsrtx
+dsr_encoder/src/test_dsr
+dsr_encoder/build/
+
+# DSRDemo runtime state (PIDs, logs)
+run/
+
+# Generated signals and recordings
+*.iq
+*.raw
+*.bin
+*.wav

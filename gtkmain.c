@@ -17,7 +17,7 @@
 #include "dsr_engine.h"
 
 #define APP_TITLE   "DSR Decoder"
-#define APP_VER     "0.9.5p-gtk"
+#define APP_VER     "0.9.6-gtk"
 #define TICK_MS     200
 #define CONFIG_FILE "dsrdec-gtk.ini"
 #define LIST_MIN_ROWS 16          /* channel list rows always visible */
