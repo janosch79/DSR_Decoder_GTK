@@ -1,5 +1,5 @@
 # DSR_Decoder
-by janosch79 2025
+by janosch79 2025 · **Version 0.9.6** · [Deutsche Version](README.de.md)
 C application to decode DSR (Digital Satellite Radio) signals from I/Q sample files, raw bitstream files, or a live UDP stream — with built-in IQ demodulation and ALSA/WAV audio output. Available as a command-line tool (`dsrdec`) and as an optional GTK 3 GUI (`dsrdec-gtk`).
 
 A matching DSR encoder (`dsrtx`) is bundled in [dsr_encoder/](dsr_encoder/), so you can run a complete transmitter → receiver chain on one machine.
@@ -17,6 +17,8 @@ sudo apt install build-essential pkg-config libasound2-dev libgtk-3-dev \
 # Build and start (the first run compiles encoder and decoder, takes a few seconds)
 ./DSRDemo start
 ```
+
+On WSL2 (Windows), also set up the ALSA → PulseAudio bridge once, otherwise there is no sound: see [Audio on WSL2](#audio-on-wsl2).
 
 There is no separate build step: `./DSRDemo start` runs `make` itself and builds whatever is missing or changed (see [Build](#build) to build by hand). If a library is missing, it tells you which `apt install` to run.
 
@@ -59,13 +61,13 @@ Notes:
 
 There is one makefile for everything, at the top level; the encoder's objects are kept next to its sources in `dsr_encoder/src`.
 
-Rebuild everything: `make clean && make && make gtk`n
+Rebuild everything: `make clean && make && make gtk`
 
 ### Dependencies
 - ALSA development libraries (libasound2-dev on Debian/Ubuntu)
 - Standard C library with POSIX support
 - Math library (-lm)
-- GUI only: GTK 3 development libraries (libgtk-3-dev on Debian/Ubutu)
+- GUI only: GTK 3 development libraries (libgtk-3-dev on Debian/Ubuntu)
 - Optional, for live reception with a HackRF One: libhackrf (libhackrf-dev)
 
 Debian/Ubuntu:
@@ -76,6 +78,29 @@ sudo apt install libhackrf-dev                               # optional: HackRF 
 ```
 
 The build system automatically detects ALSA via pkg-config, falling back to `-lasound` if needed. GTK is detected via `pkg-config gtk+-3.0`. `make gtk` stops with a hint if GTK is missing, and the CLI build does not need GTK at all. libhackrf is detected via `pkg-config libhackrf`; without it both programs still build, and the HackRF source reports that it is not built in.
+
+### Audio on WSL2
+
+WSL2 has no sound card of its own. WSLg provides a PulseAudio server (`PULSE_SERVER=unix:/mnt/wslg/PulseServer`), but both decoders play through ALSA, and Ubuntu on WSL does not install the bridge from ALSA to PulseAudio. Without it, live audio fails to open or stays silent. Set it up once:
+
+```bash
+sudo apt install libasound2-plugins alsa-utils    # ALSA pulse plugin + test tools
+
+sudo tee /etc/asound.conf >/dev/null <<'EOF'
+pcm.!default {
+    type pulse
+    hint.description "Default Audio Device"
+}
+
+ctl.!default {
+    type pulse
+}
+EOF
+
+aplay /usr/share/sounds/alsa/Front_Center.wav    # test: you should hear "Front Center"
+```
+
+If audio plays for a while and then stops, or `aplay` reports `PulseAudio: Unable to create stream: Timeout`, the WSLg audio server itself has stalled (this happens without the decoder too). Restarting WSL usually brings it back: run `wsl --shutdown` in PowerShell, then open the WSL terminal again.
 
 The makefile compiles with `-O3 -march=native`, so the binaries are tuned for the build machine's CPU and may not run on other (older) CPUs. Build on the target machine, or remove `-march=native` from `CFLAGS` for a portable binary.
 
@@ -248,7 +273,7 @@ make gtk
 ./dsrdec-gtk
 ```
 
-On WSL2 the window is displayed via WSLg; no extra X server is needed.
+On WSL2 the window is displayed via WSLg; no extra X server is needed. For sound, see [Audio on WSL2](#audio-on-wsl2).
 
 ### Window layout
 
