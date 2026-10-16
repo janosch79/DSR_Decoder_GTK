@@ -8,8 +8,8 @@ Ein passender DSR-Encoder (`dsrtx`) liegt in [dsr_encoder/](dsr_encoder/) bei. D
 ## Schnellstart
 
 ```bash
-git clone https://github.com/janosch79/DSR_Decoder.git
-cd DSR_Decoder
+git clone https://github.com/janosch79/DSR_Decoder_GTK.git
+cd DSR_Decoder_GTK
 
 # Build-Abhängigkeiten (Debian/Ubuntu)
 sudo apt install build-essential pkg-config libasound2-dev libgtk-3-dev \

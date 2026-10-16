@@ -8,7 +8,7 @@ A matching DSR encoder (`dsrtx`) is bundled in [dsr_encoder/](dsr_encoder/), so 
 
 ```bash
 git clone https://github.com/janosch79/DSR_Decoder_GTK.git
-cd DSR_Decoder
+cd DSR_Decoder_GTK
 
 # Build dependencies (Debian/Ubuntu)
 sudo apt install build-essential pkg-config libasound2-dev libgtk-3-dev \
